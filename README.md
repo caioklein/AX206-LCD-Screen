@@ -1,6 +1,6 @@
 # Appotech AX206 LCD Screen Manager
 
-A modern Windows GUI replacement for `WebBrowserV23Port2020.exe` (also known as **2.1mianqu / 独立屏免驱驱动**) for managing compatible USB LCD photo-frame displays. Play media directly from your PC, or save it to the screen so it can keep playing when your computer is off.
+A modern Windows GUI replacement for `WebBrowserV23Port2020.exe` (also known as **2.1mianqu / 独立屏免驱驱动 / MianQ 2.1**) for managing compatible USB LCD photo-frame displays. Play media directly from your PC, or save it to the screen so it can keep playing when your computer is off. This is NOT the official software from [TURZX](https://www.turzx.com/) and it's not affiliated with them in any way whatsoever. This software replaces the need for the original 2.1-inch round IPS LCD software that the vendor recommends. Wishful thinking, but I wish any search for WebBrowserV23Port2020 would redirect here, since it is the app that comes bundled with the aliexpress purchases and what most people would use, any search is kinda useless because it thinks the software/driver is a bunch of other stuff.
 
 <p align="center">
   <a href="https://github.com/caioklein/AX206-LCD-Screen/releases/tag/v1.1.0"><img src="https://img.shields.io/badge/Download-v1.1.0-2ea44f?style=for-the-badge&logo=github" alt="Download Appotech AX206 LCD Screen Manager v1.1.0"></a>
@@ -23,6 +23,8 @@ A modern Windows GUI replacement for `WebBrowserV23Port2020.exe` (also known as 
 ![Appotech AX206 LCD Screen Manager showing media being cast to the LCD display](dark_casting.png)
 
 ## Download and run
+
+Pre-requirements: USB Driver [WinUSB (v6.1.7600.16385)](https://zadig.akeo.ie/) just click on Install WCID Driver
 
 **[Download Appotech AX206 LCD Screen Manager v1.1.0](https://github.com/caioklein/AX206-LCD-Screen/releases/tag/v1.1.0)**
 

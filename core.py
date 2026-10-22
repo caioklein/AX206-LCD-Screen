@@ -12,7 +12,7 @@ import media
 from lcdproto import Lcd, LcdError, MediaError
 
 APP_NAME = "Appotech AX206 LCD Screen Manager"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # Index == the value stored on the screen.
 IDLE_MODES = ["Turn screen off", "Show saved media"]       # "Off mode":  what the screen does once the PC app is gone
@@ -22,8 +22,8 @@ FIT_MODES = [("Fill", "cover"), ("Fit", "contain"), ("Stretch", "stretch")]
 MEDIA_TYPES = "*.png *.jpg *.jpeg *.bmp *.gif *.avi *.mp4 *.mkv *.mov *.webm *.wmv *.flv"
 
 DEFAULTS = dict(OffMode=1, WorkMode=1, LcdDir=0, AutoStart=0, PlayLocalX=0, PlayLocalY=0,
-                ResPath="", Fit="cover", Step=5, Theme="dark")
-INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step")
+                ResPath="", Fit="cover", Step=5, Theme="dark", TrayMin=1)
+INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step", "TrayMin")
 
 
 # --------------------------------------------------------------------------- settings file
@@ -74,9 +74,9 @@ def set_autostart(on):
     except ImportError:
         return
     if getattr(sys, "frozen", False):
-        cmd = '"%s"' % sys.executable
+        cmd = '"%s" --minimized' % sys.executable
     else:
-        cmd = '"%s" "%s"' % (sys.executable.replace("python.exe", "pythonw.exe"), os.path.abspath(sys.argv[0]))
+        cmd = '"%s" "%s" --minimized' % (sys.executable.replace("python.exe", "pythonw.exe"), os.path.abspath(sys.argv[0]))
     key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
                          winreg.KEY_SET_VALUE)
     try:

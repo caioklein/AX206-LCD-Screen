@@ -12,18 +12,19 @@ import media
 from lcdproto import Lcd, LcdError, MediaError
 
 APP_NAME = "Appotech AX206 LCD Screen Manager"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 # Index == the value stored on the screen.
 IDLE_MODES = ["Turn screen off", "Show saved media"]       # "Off mode":  what the screen does once the PC app is gone
 START_MODES = ["Live from PC", "Saved media"]              # "Work mode": what the screen shows when it powers up
 ORIENTATIONS = ["0°", "90°", "180°", "270°"]               # "Lcd dir"
 FIT_MODES = [("Fill", "cover"), ("Fit", "contain"), ("Stretch", "stretch")]
+FPS_CHOICES = (10, 15, 24)                                  # casting frame rate: lower = less CPU
 MEDIA_TYPES = "*.png *.jpg *.jpeg *.bmp *.gif *.avi *.mp4 *.mkv *.mov *.webm *.wmv *.flv"
 
 DEFAULTS = dict(OffMode=1, WorkMode=1, LcdDir=0, AutoStart=0, PlayLocalX=0, PlayLocalY=0,
-                ResPath="", Fit="cover", Step=5, Theme="dark", TrayMin=1)
-INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step", "TrayMin")
+                ResPath="", Fit="cover", Step=5, Theme="dark", TrayMin=1, Fps=15, HwDecode=1)
+INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step", "TrayMin", "Fps", "HwDecode")
 
 
 # --------------------------------------------------------------------------- settings file
@@ -106,7 +107,7 @@ def do_write(path, cfg, fit="cover", raw=False, activate=False, progress=None, l
     lcd = lcd or Lcd()
     try:
         w, h = lcd.get_info()
-        blob = media.build_resource(path, w, h, fit=fit, raw=raw)
+        blob = media.build_resource(path, w, h, fit=fit, raw=raw, hwaccel=bool(cfg.get("HwDecode", 1)))
         lcd.flash_write(blob, progress)
         if activate:
             lcd.write_settings(1, 1, cfg["LcdDir"])
@@ -130,11 +131,14 @@ def do_play(path, cfg, stop, loop=False, fps=15, fit="cover", hold=True, lcd=Non
             exit_mode=False, on_error=None):
     """Cast a file live from the PC until `stop` is set. Nothing is stored on the screen.
 
+    CPU use: the first pass decodes the file and records the encoded JPEG frames in a FrameCache while streaming;
+    every later loop replays the cache, so ffmpeg is not running at all in steady state.
+
     `cmds` is an optional queue.Queue the GUI uses while casting:
-        ("offset", x, y)        shift the picture
-        ("media", path, fit)    switch to another file WITHOUT stopping (the screen keeps receiving frames;
-                                if the new file cannot be decoded, `on_error(msg)` is called and the previous
-                                file keeps playing)
+        ("offset", x, y)             shift the picture
+        ("media", path, fit, fps)    switch to another file / setting WITHOUT stopping (the screen keeps receiving
+                                     frames; if the new file cannot be decoded, `on_error(msg)` is called and the
+                                     previous file keeps playing)
     """
     own = lcd is None
     lcd = lcd or Lcd()
@@ -162,7 +166,7 @@ def do_play(path, cfg, stop, loop=False, fps=15, fit="cover", hold=True, lcd=Non
             return any(c[0] == "media" for c in cmds.queue)
 
     def take_commands():
-        """Run queued commands on THIS connection; return the newest requested (path, fit) or None."""
+        """Run queued commands on THIS connection; return the newest requested media tuple or None."""
         newest = None
         while cmds is not None:
             try:
@@ -172,7 +176,7 @@ def do_play(path, cfg, stop, loop=False, fps=15, fit="cover", hold=True, lcd=Non
             if kind == "offset":
                 lcd.set_offset(*args)
             elif kind == "media":
-                newest = (args[0], args[1])
+                newest = tuple(args) + (None,) * (3 - len(args))
         return newest
 
     def nap(seconds):                                    # sleep, but wake up for stop / a media switch
@@ -185,58 +189,62 @@ def do_play(path, cfg, stop, loop=False, fps=15, fit="cover", hold=True, lcd=Non
 
     try:
         w, h = lcd.get_info()
-        cur, prev = (path, fit), None
+        cur, prev = (path, fit, fps), None
         while not stop.is_set():
             switched, bad = None, None
-            cache, cacheable = [], True
-            while switched is None and bad is None and not stop.is_set():
-                replay = cacheable and bool(cache)       # short clips are decoded once, then replayed
-                source = iter(cache) if replay else media.frames(cur[0], w, h, cfg["LcdDir"], cur[1], fps)
-                n, last = 0, None
-                try:
-                    while True:
-                        try:
-                            jpg, dur = next(source)
-                        except StopIteration:
-                            break
-                        except Exception as e:           # noqa: BLE001 - the file could not be decoded
-                            bad = e
-                            break
-                        if stop.is_set():
-                            break
-                        switched = take_commands()
-                        if switched:
-                            break
-                        t0 = time.time()
-                        send(jpg)
-                        n, last = n + 1, jpg
-                        if not replay and cacheable:
-                            if len(cache) < 300:
-                                cache.append((jpg, dur))
-                            else:
-                                cacheable, cache = False, []
-                        nap(dur - (time.time() - t0))
-                finally:
-                    if hasattr(source, "close"):
+            cache = media.FrameCache()
+            try:
+                while switched is None and bad is None and not stop.is_set():
+                    replay = cache.complete
+                    recording = not replay and not cache.overflow
+                    source = cache.frames() if replay else media.frames(
+                        cur[0], w, h, cfg["LcdDir"], cur[1], cur[2], hwaccel=bool(cfg.get("HwDecode", 1)))
+                    n, last, natural = 0, None, False
+                    try:
+                        while True:
+                            try:
+                                jpg, dur = next(source)
+                            except StopIteration:
+                                natural = True
+                                break
+                            except Exception as e:       # noqa: BLE001 - the file could not be decoded
+                                bad = e
+                                break
+                            if stop.is_set():
+                                break
+                            switched = take_commands()
+                            if switched:
+                                break
+                            t0 = time.time()
+                            send(jpg)
+                            n, last = n + 1, jpg
+                            if recording:
+                                cache.add(jpg, dur)
+                            nap(dur - (time.time() - t0))
+                    finally:
                         source.close()                   # stops ffmpeg when we leave a video early
-                if switched or bad is not None or stop.is_set():
-                    break
-                if n == 0:
-                    bad = MediaError("Could not read any frames from this file")
-                    break
-                if accepted == 0:
-                    raise LcdError("The screen did not accept any frames")
-                if n == 1 and hold:                      # a still picture: keep it alive until stopped/switched
-                    while not stop.is_set() and switched is None:
-                        nap(1.0)
-                        if stop.is_set():
-                            break
-                        switched = take_commands()
-                        if switched is None:
-                            send(last)
-                    break
-                if not loop:
-                    return
+                    if switched or bad is not None or stop.is_set():
+                        break
+                    if n == 0:
+                        bad = MediaError("Could not read any frames from this file")
+                        break
+                    if accepted == 0:
+                        raise LcdError("The screen did not accept any frames")
+                    if n == 1 and hold:                  # a still picture: keep it alive until stopped/switched
+                        while not stop.is_set() and switched is None:
+                            nap(1.0)
+                            if stop.is_set():
+                                break
+                            switched = take_commands()
+                            if switched is None:
+                                send(last)
+                        break
+                    if not loop:
+                        return
+                    if natural and recording and not cache.overflow and len(cache) > 1:
+                        cache.complete = True            # from now on: replay, no decoding
+            finally:
+                cache.close()
             if bad is not None:
                 if prev is None:                         # the very first file: nothing to fall back to
                     raise bad if isinstance(bad, LcdError) else MediaError("Cannot play this file: %s" % bad)
@@ -244,7 +252,7 @@ def do_play(path, cfg, stop, loop=False, fps=15, fit="cover", hold=True, lcd=Non
                     on_error("Cannot play %s (%s). Still casting the previous file." % (os.path.basename(cur[0]), bad))
                 cur, prev = prev, None
             elif switched:
-                prev, cur = cur, switched
+                prev, cur = cur, (switched[0], switched[1], switched[2] or cur[2])
     except Exception:
         failed = True
         raise

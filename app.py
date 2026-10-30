@@ -19,7 +19,8 @@ from tkinter import filedialog, messagebox
 
 import core
 import media
-from core import (APP_NAME, APP_VERSION, FIT_MODES, IDLE_MODES, MEDIA_TYPES, ORIENTATIONS, START_MODES)
+from core import (APP_NAME, APP_VERSION, FIT_MODES, FPS_CHOICES, IDLE_MODES, MEDIA_TYPES, ORIENTATIONS,
+                  START_MODES)
 from lcdproto import LcdError, MediaError
 
 try:                                           # system tray support (optional: without it, minimize works normally)
@@ -62,18 +63,21 @@ def friendly(e):
 
 
 class App(ctk.CTk):
-    def __init__(self, demo=False, first_file=None, screenshot=None, theme=None, start_minimized=False):
+    def __init__(self, demo=False, first_file=None, screenshot=None, theme=None, start_minimized=False,
+                 autoplay=None):
         self.cfg = core.load_cfg()
         if theme:
             self.cfg["Theme"] = theme
         ctk.set_appearance_mode(self.cfg["Theme"])
         super().__init__(fg_color=BG)
+        if start_minimized:
+            self.withdraw()                       # hidden from the very first moment (no flash on screen)
         self.title(APP_NAME)
         try:
             scale = ctk.ScalingTracker.get_window_scaling(self)
         except Exception:
             scale = 1.0
-        h = int(min(740, self.winfo_screenheight() / scale - 90))
+        h = int(min(780, self.winfo_screenheight() / scale - 90))
         self.geometry("1000x%d" % max(h, 560))
         self.minsize(940, 560)
         ico = resource_path(os.path.join("assets", "app.ico"))
@@ -81,6 +85,8 @@ class App(ctk.CTk):
             self.after(250, lambda: self._try_icon(ico))
 
         self.demo = demo
+        self.autoplay = bool(self.cfg["AutoPlay"]) if autoplay is None else bool(autoplay)
+        self._srv = None
         self.tray = None
         self._tray_hint = False
         self.lcd = None
@@ -96,14 +102,28 @@ class App(ctk.CTk):
         self._load_path()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Unmap>", self._on_unmap)
-        if self.cfg["TrayMin"]:
-            self._start_tray()
+        if self.cfg["TrayMin"] or start_minimized:
+            self._start_tray()                    # a minimized start always lives in the tray
         if start_minimized:                       # e.g. launched by "Start with Windows"
-            self.after(250, self._go_background)
+            self.after(150, self._go_background)
         self.after(50, self._pump)
-        self.after(500, self.connect)
+        self.after(500, self._startup)
         if screenshot:
             self.after(4500, lambda: self._screenshot(screenshot))
+
+    def _startup(self):
+        """When the app opens: start playing the last media by itself, otherwise just connect."""
+        path = self.cfg["ResPath"]
+        if self.autoplay and path and os.path.exists(path):
+            self.toggle_preview(persistent=True)
+        else:
+            if self.autoplay and path:                       # say why nothing started (survives the connect message)
+                self._drop_lcd()
+                self.run_task(lambda lcd: lcd.get_info(),
+                              lambda r: "Connected (%d × %d), but the last media file was not found: %s"
+                              % (r + (os.path.basename(path),)), "Connecting to the screen…", done_kind="bad")
+            else:
+                self.connect()
 
     # ------------------------------------------------------------------ helpers
     def _try_icon(self, ico):
@@ -266,6 +286,22 @@ class App(ctk.CTk):
         self._caption(acts, "Casts the file live from this PC without saving anything. You can pick another file "
                             "while it plays. When you stop, the screen goes back to its stored media."
                       ).pack(anchor="w", pady=(6, 0))
+        perf = ctk.CTkFrame(acts, fg_color="transparent")
+        perf.pack(fill="x", pady=(12, 0))
+        ctk.CTkLabel(perf, text="Frame rate", font=font(12, "bold"), text_color=TEXT).pack(side="left")
+        self.seg_fps = self._segmented(perf, ["%d fps" % f for f in FPS_CHOICES], self._fit_changed)
+        self.seg_fps.set("%d fps" % (self.cfg["Fps"] if self.cfg["Fps"] in FPS_CHOICES else 15))
+        self.seg_fps.pack(side="left", padx=(12, 0))
+        self.hw_var = ctk.BooleanVar(value=bool(self.cfg["HwDecode"]))
+        ctk.CTkCheckBox(acts, text="Decode video with the graphics card (less CPU)", variable=self.hw_var,
+                        command=self._fit_changed, font=font(12), text_color=TEXT, fg_color=ACCENT,
+                        hover_color=ACCENT_HOVER, corner_radius=6, checkbox_width=18, checkbox_height=18
+                        ).pack(anchor="w", pady=(10, 0))
+        self.autoplay_var = ctk.BooleanVar(value=bool(self.cfg["AutoPlay"]))
+        ctk.CTkCheckBox(acts, text="Start playing automatically when the app opens", variable=self.autoplay_var,
+                        command=self._fit_changed, font=font(12), text_color=TEXT, fg_color=ACCENT,
+                        hover_color=ACCENT_HOVER, corner_radius=6, checkbox_width=18, checkbox_height=18
+                        ).pack(anchor="w", pady=(10, 0))
 
         self.progress_box = ctk.CTkFrame(card, fg_color="transparent")
         self.progress_box.pack(fill="x", padx=20, pady=(12, 14))
@@ -360,6 +396,9 @@ class App(ctk.CTk):
         self.cfg["LcdDir"] = ORIENTATIONS.index(self.seg_rot.get())
         self.cfg["Step"] = int(self.seg_step.get().split()[0])
         self.cfg["Fit"] = dict(FIT_MODES)[self.seg_fit.get()]
+        self.cfg["Fps"] = int(self.seg_fps.get().split()[0])
+        self.cfg["HwDecode"] = int(self.hw_var.get())
+        self.cfg["AutoPlay"] = int(self.autoplay_var.get())
         self.cfg["AutoStart"] = int(self.auto_var.get())
         self.cfg["Theme"] = "light" if self.theme_var.get() else "dark"
         self.cfg["TrayMin"] = int(self.tray_var.get())
@@ -387,10 +426,20 @@ class App(ctk.CTk):
     def _fail(self, e):
         self._drop_lcd()
         msg = friendly(e)
-        self.post(lambda: (self.set_link("bad", "Not connected"), self.set_status(str(e).split("\n")[0], "bad"),
-                           messagebox.showerror("Something went wrong", msg)))
 
-    def run_task(self, fn, done_msg, busy_msg):
+        def show():
+            self.set_link("bad", "Not connected")
+            self.set_status(str(e).split("\n")[0], "bad")
+            if self.state() == "withdrawn" and self.tray is not None:      # hidden in the tray: no modal popup
+                try:
+                    self.tray.notify(msg[:200], APP_NAME)
+                except Exception:                                          # noqa: BLE001
+                    pass
+            else:
+                messagebox.showerror("Something went wrong", msg)
+        self.post(show)
+
+    def run_task(self, fn, done_msg, busy_msg, done_kind="ok"):
         if self.busy or self.preview:
             return
         self.busy = True
@@ -401,7 +450,7 @@ class App(ctk.CTk):
             try:
                 res = fn(self._ensure_lcd())
                 msg = done_msg(res) if callable(done_msg) else done_msg
-                self.post(lambda: self.set_status(msg, "ok"))
+                self.post(lambda: self.set_status(msg, done_kind))
             except Exception as e:                       # noqa: BLE001 - show anything to the user
                 self._fail(e)
             finally:
@@ -436,14 +485,14 @@ class App(ctk.CTk):
     def _switch_cast(self):
         """Tell the running cast to play the selected file (no stop, no flicker back to stored media)."""
         self._collect()
-        self.preview[2].put(("media", self.cfg["ResPath"], self.cfg["Fit"]))
+        self.preview[2].put(("media", self.cfg["ResPath"], self.cfg["Fit"], self.cfg["Fps"]))
         self.set_status("Casting media to the screen: %s" % os.path.basename(self.cfg["ResPath"]), "busy")
         self._tray_update()
 
     def _fit_changed(self, _=None):
         self._collect()
         if self.preview and not self.preview[1].is_set() and self.cfg["ResPath"]:
-            self._switch_cast()                               # re-render the current file with the new fit
+            self._switch_cast()                               # restart the current file with the new fit / frame rate / decoder
 
     def _load_path(self):
         path = self.cfg["ResPath"]
@@ -502,7 +551,9 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ casting
     CAST_MSG = "Casting media to the screen. Choose another file to switch without stopping."
 
-    def toggle_preview(self):
+    def toggle_preview(self, persistent=False):
+        """Start/stop casting. persistent=True (used when the app opens by itself): if the screen is not there yet
+        (just logged in, USB still starting, PC woke from sleep) keep trying quietly instead of showing an error."""
         if self.preview:
             self.preview[1].set()
             self.set_status("Stopping…", "busy")
@@ -513,34 +564,50 @@ class App(ctk.CTk):
             return
         self._collect()
         stop, cmds = threading.Event(), queue.Queue()
-        accepted = [0]
+        accepted, ever = [0], [0]
 
         def count():
             accepted[0] += 1
+            ever[0] += 1
 
         def warn(msg):                                       # a file picked mid-cast could not be played
             self.post(lambda: (self.set_status(msg, "bad"), messagebox.showwarning("Could not play that file", msg)))
 
         def work():
+            tries = 0
             try:
-                for attempt in (0, 1):
+                while True:
+                    accepted[0] = 0
                     self.post(lambda: self.set_status(
                         "Connecting to the screen…" if self.lcd is None else self.CAST_MSG, "busy"))
                     try:
                         lcd = self._ensure_lcd()
                         self.post(lambda: self.set_status(self.CAST_MSG, "busy"))
-                        core.do_play(path, self.cfg, stop, loop=True, fit=self.cfg["Fit"], lcd=lcd, cmds=cmds,
-                                     exit_mode=True, on_frame=count, on_error=warn)
+                        core.do_play(path, self.cfg, stop, loop=True, fps=self.cfg["Fps"], fit=self.cfg["Fit"],
+                                     lcd=lcd, cmds=cmds, exit_mode=True, on_frame=count, on_error=warn)
                         break
                     except LcdError as e:
+                        tries += 1
+                        retriable = not isinstance(e, MediaError) and not stop.is_set()
+                        if persistent and retriable:         # wait for the screen (login, sleep/wake, unplugged...)
+                            self._drop_lcd()
+                            self.post(lambda: (self.set_link("wait", "Waiting for the screen…"), self.set_status(
+                                "Waiting for the screen… casting starts as soon as it is detected.", "busy")))
+                            if stop.wait(3.0):
+                                break
+                            continue
                         # The screen may have left PC mode (e.g. after the last cast): reconnect once and retry.
-                        if attempt == 0 and accepted[0] == 0 and not stop.is_set() and not isinstance(e, MediaError):
+                        if retriable and tries == 1 and accepted[0] == 0:
                             self._drop_lcd()
                             continue
                         raise
                 self._drop_lcd()          # the stop command took the screen out of PC mode: start fresh next time
-                back = ("Casting stopped. The screen is back to its stored media." if self.cfg["OffMode"] == 1
-                        else "Casting stopped. The screen is now off.")
+                if not ever[0]:
+                    back = "Stopped waiting for the screen."
+                elif self.cfg["OffMode"] == 1:
+                    back = "Casting stopped. The screen is back to its stored media."
+                else:
+                    back = "Casting stopped. The screen is now off."
                 self.post(lambda: self.set_status(back, "ok"))
             except Exception as e:                           # noqa: BLE001
                 self._fail(e)
@@ -685,7 +752,7 @@ class App(ctk.CTk):
                 pass
 
     def _go_background(self):
-        if self.cfg["TrayMin"] and self.tray is not None:
+        if self.tray is not None:
             self._hide_to_tray(notify=False)
         else:
             self.iconify()
@@ -703,8 +770,17 @@ class App(ctk.CTk):
             self._show_window()                   # so the "still working" question is visible
         self.on_close()
 
+    # ------------------------------------------------------------------ single instance
+    def listen(self, srv):
+        """A second launch asks this copy to show its window (instead of two copies fighting over the USB screen)."""
+        self._srv = srv
+        core.serve_instance(srv, lambda: self.post(self._show_window))
+
     # ------------------------------------------------------------------ shutdown
     def destroy(self):
+        if self._srv is not None:
+            core.close_instance(self._srv)
+            self._srv = None
         self._stop_tray()                         # the tray thread would otherwise keep the process alive
         super().destroy()
 
@@ -751,6 +827,12 @@ def selftest(outfile):
         rec("video thumbnail", media.thumbnail(mp4, 64) is not None)
         fr = list(media.frames(mp4, 480, 480))
         rec("video frames decode to 480x480 JPEG", len(fr) >= 8 and fr[0][0][:2] == b"\xff\xd8", "%d frames" % len(fr))
+        rec("GPU-decode path works or falls back to software",
+            len(list(media.frames(mp4, 480, 480, 0, "cover", 15, hwaccel=True))) >= 8)
+        cache = media.FrameCache()
+        for jpg, d in fr:
+            cache.add(jpg, d)
+        rec("frame cache stores and replays", len(cache) == len(fr) and len(list(cache.frames())) == len(fr))
         blob = media.build_resource(mp4, 480, 480)
         rec("video -> MJPEG AVI resource (type 4, fits 3.7 MB)", blob[0] == 4 and blob[16:20] == b"RIFF",
             "%.2f MB" % (len(blob) / 1048576))
@@ -773,6 +855,7 @@ def main(argv=None):
     ap.add_argument("file", nargs="?", help="media file to select on start")
     ap.add_argument("--demo", action="store_true", help="simulate the screen (no hardware needed)")
     ap.add_argument("--minimized", action="store_true", help="start hidden in the system tray")
+    ap.add_argument("--no-autoplay", action="store_true", help="do not start playing automatically")
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     ap.add_argument("--theme", choices=["dark", "light"], help="override the saved theme for this run")
     ap.add_argument("--trace", action="store_true", help="log USB traffic to stderr")
@@ -784,8 +867,18 @@ def main(argv=None):
         lcdproto.TRACE = True
         if sys.stderr is None:                            # windowed exe: no console, log to a file instead
             lcdproto.TRACE_FILE = os.path.join(os.path.dirname(core.config_path()), "usb_trace.log")
-    App(demo=a.demo, first_file=a.file, screenshot=a.screenshot, theme=a.theme,
-        start_minimized=a.minimized).mainloop()
+    srv = None
+    if not (a.demo or a.screenshot):
+        srv = core.single_instance()                      # exits here if the app is already running
+        try:
+            core.refresh_autostart(core.load_cfg())       # keep "Start with Windows" pointing at this copy
+        except Exception:                                 # noqa: BLE001
+            pass
+    app = App(demo=a.demo, first_file=a.file, screenshot=a.screenshot, theme=a.theme,
+              start_minimized=a.minimized, autoplay=False if a.no_autoplay else None)
+    if srv is not None:
+        app.listen(srv)
+    app.mainloop()
 
 
 if __name__ == "__main__":

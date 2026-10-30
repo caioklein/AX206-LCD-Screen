@@ -4,7 +4,9 @@ core.py - settings, user-facing labels and the high-level actions shared by the 
 import configparser
 import os
 import queue
+import socket
 import sys
+import threading
 import time
 
 import lcdproto
@@ -12,7 +14,7 @@ import media
 from lcdproto import Lcd, LcdError, MediaError
 
 APP_NAME = "Appotech AX206 LCD Screen Manager"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 # Index == the value stored on the screen.
 IDLE_MODES = ["Turn screen off", "Show saved media"]       # "Off mode":  what the screen does once the PC app is gone
@@ -23,8 +25,8 @@ FPS_CHOICES = (10, 15, 24)                                  # casting frame rate
 MEDIA_TYPES = "*.png *.jpg *.jpeg *.bmp *.gif *.avi *.mp4 *.mkv *.mov *.webm *.wmv *.flv"
 
 DEFAULTS = dict(OffMode=1, WorkMode=1, LcdDir=0, AutoStart=0, PlayLocalX=0, PlayLocalY=0,
-                ResPath="", Fit="cover", Step=5, Theme="dark", TrayMin=1, Fps=15, HwDecode=1)
-INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step", "TrayMin", "Fps", "HwDecode")
+                ResPath="", Fit="cover", Step=5, Theme="dark", TrayMin=1, Fps=15, HwDecode=1, AutoPlay=1)
+INT_KEYS = ("OffMode", "WorkMode", "LcdDir", "AutoStart", "PlayLocalX", "PlayLocalY", "Step", "TrayMin", "Fps", "HwDecode", "AutoPlay")
 
 
 # --------------------------------------------------------------------------- settings file
@@ -68,28 +70,124 @@ def save_cfg(cfg, path=None):
         cp.write(f)
 
 
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_NAME = "AppotechLCDManager"
+
+
+def _autostart_command():
+    if getattr(sys, "frozen", False):
+        return '"%s" --minimized' % sys.executable
+    return '"%s" "%s" --minimized' % (sys.executable.replace("python.exe", "pythonw.exe"), os.path.abspath(sys.argv[0]))
+
+
+def _exe_of(cmd):
+    cmd = cmd.strip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        return cmd[1:end] if end > 0 else cmd[1:]
+    return cmd.split(" ")[0]
+
+
 def set_autostart(on):
-    """'Start with Windows': HKCU\\...\\Run entry (no-op on other systems)."""
+    """'Start with Windows': HKCU\\...\\Run entry that starts the app hidden in the tray (no-op on other systems)."""
     try:
         import winreg
     except ImportError:
         return
-    if getattr(sys, "frozen", False):
-        cmd = '"%s" --minimized' % sys.executable
-    else:
-        cmd = '"%s" "%s" --minimized' % (sys.executable.replace("python.exe", "pythonw.exe"), os.path.abspath(sys.argv[0]))
-    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
-                         winreg.KEY_SET_VALUE)
+    key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE)
     try:
         if on:
-            winreg.SetValueEx(key, "AppotechLCDManager", 0, winreg.REG_SZ, cmd)
+            winreg.SetValueEx(key, _RUN_NAME, 0, winreg.REG_SZ, _autostart_command())
         else:
             try:
-                winreg.DeleteValue(key, "AppotechLCDManager")
+                winreg.DeleteValue(key, _RUN_NAME)
             except FileNotFoundError:
                 pass
     finally:
         winreg.CloseKey(key)
+
+
+def refresh_autostart(cfg):
+    """Called on every launch: keeps an EXISTING startup entry current. Adds --minimized to entries written by older
+    versions and repoints an entry whose file no longer exists. Never creates an entry (the user may have removed it
+    on purpose) and leaves an entry that points to another existing copy alone. Returns True when it changed it."""
+    if not cfg.get("AutoStart"):
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE)
+    except (ImportError, OSError):
+        return False
+    try:
+        try:
+            cur, _ = winreg.QueryValueEx(key, _RUN_NAME)
+        except FileNotFoundError:
+            return False
+        want = _autostart_command()
+        if cur == want:
+            return False
+        same = os.path.normcase(os.path.abspath(_exe_of(cur))) == os.path.normcase(os.path.abspath(_exe_of(want)))
+        if same or not os.path.exists(_exe_of(cur)):
+            winreg.SetValueEx(key, _RUN_NAME, 0, winreg.REG_SZ, want)
+            return True
+        return False
+    finally:
+        winreg.CloseKey(key)
+
+
+# --------------------------------------------------------------------------- single instance
+INSTANCE_PORT = 47813
+
+
+def single_instance():
+    """First copy: returns a listening socket on localhost. A copy is already running: asks it to show its window
+    and exits this process. Port used by something else (no answer): returns None and the app just runs."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name != "nt":                                   # (on Windows this option would allow port hijacking)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind(("127.0.0.1", INSTANCE_PORT))
+        srv.listen(4)
+        return srv
+    except OSError:
+        srv.close()
+    try:
+        with socket.create_connection(("127.0.0.1", INSTANCE_PORT), timeout=1.5) as c:
+            c.sendall(b"show\n")
+            if c.recv(8).startswith(b"ok"):
+                sys.exit(0)
+    except OSError:
+        pass
+    return None
+
+
+def close_instance(srv):
+    """Stop listening: shutdown first so a blocked accept() wakes up and the port is really released."""
+    for action in (lambda: srv.shutdown(socket.SHUT_RDWR), srv.close):
+        try:
+            action()
+        except OSError:
+            pass
+
+
+def serve_instance(srv, on_show):
+    """Answer 'show' requests from later launches (runs in a daemon thread)."""
+    def loop():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return                                    # socket closed on exit
+            try:
+                conn.settimeout(1.0)
+                if conn.recv(16).startswith(b"show"):
+                    on_show()
+                    conn.sendall(b"ok\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+    threading.Thread(target=loop, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- actions
